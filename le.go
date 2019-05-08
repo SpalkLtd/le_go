@@ -35,7 +35,7 @@ type Logger struct {
 }
 
 const lineSep = "\n"
-const maxLogLength int = 65000 //add 535 chars of headroom for the filename, timestamp and header
+const maxLogLength int = 60000 //add 535 chars of headroom for the filename, timestamp and header
 
 // Connect creates a new Logger instance and opens a TCP connection to
 // logentries.com,
