@@ -25,22 +25,23 @@ import (
 // log operations can be invoked in a non-blocking way by calling them from
 // a goroutine.
 type Logger struct {
-	conn               net.Conn
-	flag               int
-	mu                 chan struct{}
-	writeLock          chan struct{}
-	concurrentWrites   chan struct{} //limit the goroutines waiting to write
-	calldepthOffset    int
-	prefix             string
-	host               string
-	token              string
-	buf                []byte
-	lastRefreshAt      time.Time
-	writeTimeout       time.Duration
-	_testWaitForWrite  *sync.WaitGroup
-	_testTimedoutWrite func()
-	wg                 *sync.WaitGroup
-	errOutput          io.Writer
+	conn                net.Conn
+	flag                int
+	mu                  chan struct{}
+	writeLock           chan struct{}
+	concurrentWrites    chan struct{} //limit the goroutines waiting to write
+	calldepthOffset     int
+	prefix              string
+	host                string
+	token               string
+	buf                 []byte
+	lastRefreshAt       time.Time
+	writeTimeout        time.Duration
+	_testWaitForWrite   *sync.WaitGroup
+	_testTimedoutWrite  func()
+	wg                  *sync.WaitGroup
+	errOutput           io.Writer
+	logErrorWhenTimeout bool
 }
 
 const lineSep = "\n"
@@ -51,7 +52,7 @@ var defaultWriteTimeout = 10 * time.Second
 // logentries.com,
 // The token can be generated at logentries.com by adding a new log,
 // choosing manual configuration and token based TCP connection.
-func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int) (*Logger, error) {
+func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int, logErrorWhenTimeout bool) (*Logger, error) {
 	logger := newEmptyLogger(host, token, calldepthOffset)
 	if concurrentWrites > 0 {
 		logger.concurrentWrites = make(chan struct{}, concurrentWrites)
@@ -65,6 +66,8 @@ func Connect(host, token string, concurrentWrites int, errOutput io.Writer, call
 		logger.errOutput = os.Stdout
 	}
 
+	//logErrorWhenTimeout is set to true when we are using teeLogger as we use log.SetOutput which redirects all log.X lines to teeLogger
+	logger.logErrorWhenTimeout = logErrorWhenTimeout
 	if err := logger.openConnection(); err != nil {
 		return nil, err
 	}
@@ -87,10 +90,6 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 	unlock(l.writeLock)
 	unlock(l.mu)
 	return l
-}
-
-func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
-	logger.errOutput = errOutput
 }
 
 // Close closes the TCP connection to logentries.com
@@ -187,6 +186,9 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 	defer func() {
 		if re := recover(); re != nil {
 			fmt.Fprintf(l.errOutput, "Panicked in logger.output %v\n", re)
+			if l.logErrorWhenTimeout {
+				log.Printf("Panicked in logger.output %v\n", re)
+			}
 			debug.PrintStack()
 			panic(re)
 		}
@@ -205,6 +207,9 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 	case <-l.mu:
 	case <-time.After(l.writeTimeout):
 		fmt.Fprintf(l.errOutput, "Timedout waiting for logger.mu, wanted to log: %s", s)
+		if l.logErrorWhenTimeout {
+			log.Printf("Timedout waiting for logger.mu, wanted to log: %s", s)
+		}
 		l._testTimedoutWrite()
 		return
 	}
@@ -222,6 +227,9 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 		case <-l.mu:
 		case <-time.After(l.writeTimeout):
 			fmt.Fprintf(l.errOutput, "Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s)
+			if l.logErrorWhenTimeout {
+				log.Printf("Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s)
+			}
 			l._testTimedoutWrite()
 			return
 		}
@@ -393,6 +401,9 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 	case <-time.After(l.writeTimeout):
 		//Bail out here
 		fmt.Fprintf(l.errOutput, "%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s)
+		if l.logErrorWhenTimeout {
+			log.Printf("%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s)
+		}
 		l._testTimedoutWrite()
 		return
 	}
