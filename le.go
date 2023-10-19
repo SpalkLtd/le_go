@@ -89,6 +89,10 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 	return l
 }
 
+func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
+	logger.errOutput = errOutput
+}
+
 // Close closes the TCP connection to logentries.com
 func (logger *Logger) Close() error {
 	if logger.conn != nil {
