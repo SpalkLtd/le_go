@@ -52,7 +52,7 @@ var defaultWriteTimeout = 10 * time.Second
 // logentries.com,
 // The token can be generated at logentries.com by adding a new log,
 // choosing manual configuration and token based TCP connection.
-func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int, logErrorWhenTimeout bool) (*Logger, error) {
+func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int) (*Logger, error) {
 	logger := newEmptyLogger(host, token, calldepthOffset)
 	if concurrentWrites > 0 {
 		logger.concurrentWrites = make(chan struct{}, concurrentWrites)
@@ -66,8 +66,6 @@ func Connect(host, token string, concurrentWrites int, errOutput io.Writer, call
 		logger.errOutput = os.Stdout
 	}
 
-	//logErrorWhenTimeout is set to true when we are using teeLogger as we use log.SetOutput which redirects all log.X lines to teeLogger
-	logger.logErrorWhenTimeout = logErrorWhenTimeout
 	if err := logger.openConnection(); err != nil {
 		return nil, err
 	}
@@ -90,6 +88,11 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 	unlock(l.writeLock)
 	unlock(l.mu)
 	return l
+}
+
+//logErrorWhenTimeout is set to true when we are using teeLogger as we use log.SetOutput which redirects all log.X lines to teeLogger
+func (logger *Logger) EnableLogErrorWhenTimeout() {
+	logger.logErrorWhenTimeout = true
 }
 
 // Close closes the TCP connection to logentries.com
