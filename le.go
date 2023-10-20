@@ -41,6 +41,7 @@ type Logger struct {
 	_testTimedoutWrite func()
 	wg                 *sync.WaitGroup
 	errOutput          io.Writer
+	errOutputMutex     *sync.RWMutex
 }
 
 const lineSep = "\n"
@@ -83,6 +84,7 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 		mu:                 make(chan struct{}, 1),
 		_testTimedoutWrite: func() {}, //NOP for prod
 		wg:                 &sync.WaitGroup{},
+		errOutputMutex:     &sync.RWMutex{},
 	}
 	unlock(l.writeLock)
 	unlock(l.mu)
@@ -90,6 +92,8 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 }
 
 func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
+	logger.errOutputMutex.Lock()
+	defer logger.errOutputMutex.Unlock()
 	logger.errOutput = errOutput
 }
 
@@ -175,6 +179,13 @@ func (logger *Logger) Flags() int {
 	return logger.flag
 }
 
+//When we want to use errOutput, make sure it is not being modified in SetErrorOutput
+func (l *Logger) writeToErrOutput(s string) {
+	l.errOutputMutex.RLock()
+	defer l.errOutputMutex.RUnlock()
+	fmt.Fprintf(l.errOutput, s)
+}
+
 // Taken with slight modification from src/log/log.go
 // Output writes the output for a logging event. The string s contains
 // the text to print after the prefix specified by the flags of the
@@ -186,7 +197,7 @@ func (logger *Logger) Flags() int {
 func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 	defer func() {
 		if re := recover(); re != nil {
-			fmt.Fprintf(l.errOutput, "Panicked in logger.output %v\n", re)
+			l.writeToErrOutput(fmt.Sprintf("Panicked in logger.output %v\n", re))
 			debug.PrintStack()
 			panic(re)
 		}
@@ -204,7 +215,7 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 	select {
 	case <-l.mu:
 	case <-time.After(l.writeTimeout):
-		fmt.Fprintf(l.errOutput, "Timedout waiting for logger.mu, wanted to log: %s", s)
+		l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu, wanted to log: %s", s))
 		l._testTimedoutWrite()
 		return
 	}
@@ -221,7 +232,7 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 		select {
 		case <-l.mu:
 		case <-time.After(l.writeTimeout):
-			fmt.Fprintf(l.errOutput, "Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s)
+			l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s))
 			l._testTimedoutWrite()
 			return
 		}
@@ -392,7 +403,7 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 	case <-l.writeLock:
 	case <-time.After(l.writeTimeout):
 		//Bail out here
-		fmt.Fprintf(l.errOutput, "%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s)
+		l.writeToErrOutput(fmt.Sprintf("%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s))
 		l._testTimedoutWrite()
 		return
 	}

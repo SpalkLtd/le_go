@@ -12,3 +12,4 @@
  - Add `errOutput` param to allow users to direct errors
  - Add `calldepthOffset` param to allow users to change the calldepth that is logged
  - Allow error output to be set
+ - Ensure that when we are using errorOutput, it is threadsafe
