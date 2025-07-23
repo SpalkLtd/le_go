@@ -42,6 +42,7 @@ type Logger struct {
 	wg                 *sync.WaitGroup
 	errOutput          io.Writer
 	errOutputMutex     *sync.RWMutex
+	numRetries         int
 }
 
 const lineSep = "\n"
@@ -179,7 +180,7 @@ func (logger *Logger) Flags() int {
 	return logger.flag
 }
 
-//When we want to use errOutput, make sure it is not being modified in SetErrorOutput
+// When we want to use errOutput, make sure it is not being modified in SetErrorOutput
 func (l *Logger) writeToErrOutput(s string) {
 	l.errOutputMutex.RLock()
 	defer l.errOutputMutex.RUnlock()
@@ -325,14 +326,15 @@ func (logger *Logger) Write(p []byte) (n int, err error) {
 	if err := logger.ensureOpenConnection(); err != nil {
 		return 0, err
 	}
+
 	return logger.conn.Write(p)
 }
 
 // Taken wholesale from src/log/log.go
 // formatHeader writes log header to buf in following order:
-//   * l.prefix (if it's not blank),
-//   * date and/or time (if corresponding flags are provided),
-//   * file and line number (if corresponding flags are provided).
+//   - l.prefix (if it's not blank),
+//   - date and/or time (if corresponding flags are provided),
+//   - file and line number (if corresponding flags are provided).
 func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
 	*buf = append(*buf, l.prefix...)
 	if l.flag&(log.Ldate|log.Ltime|log.Lmicroseconds) != 0 {
@@ -431,15 +433,24 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 			log.Printf("Wanted to log: %s", s)
 			return
 		}
-		n, err = l.Write(l.buf)
-		if err != nil {
-			log.Printf("Error in write call: %s", err.Error())
-			log.Printf("Wanted to log: %s", s)
-			return
+
+		numAttempts := 1 + l.numRetries
+		for i := 0; i < numAttempts; i++ {
+			n, err = l.Write(l.buf)
+			if err != nil {
+				log.Printf("Error in write call: %s", err.Error())
+				log.Printf("Wanted to log: %s", s)
+				continue
+			}
+
+			if l._testWaitForWrite != nil {
+				l._testWaitForWrite.Done()
+			}
+			break
 		}
 
-		if l._testWaitForWrite != nil {
-			l._testWaitForWrite.Done()
+		if err != nil {
+			return
 		}
 	}
 }
