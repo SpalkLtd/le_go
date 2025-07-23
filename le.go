@@ -312,6 +312,10 @@ func (logger *Logger) SetFlags(flag int) {
 	logger.flag = flag
 }
 
+func (logger *Logger) SetNumberOfRetries(retries int) {
+	logger.numRetries = retries
+}
+
 // SetPrefix sets the logger prefix
 func (logger *Logger) SetPrefix(prefix string) {
 	<-logger.mu
