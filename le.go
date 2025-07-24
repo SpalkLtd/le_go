@@ -444,6 +444,7 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 			if err != nil {
 				log.Printf("Error in write call: %s", err.Error())
 				log.Printf("Wanted to log: %s", s)
+				<-time.After(100 * time.Millisecond)
 				continue
 			}
 
