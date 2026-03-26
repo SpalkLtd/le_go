@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,29 +26,33 @@ import (
 // log operations can be invoked in a non-blocking way by calling them from
 // a goroutine.
 type Logger struct {
-	conn               net.Conn
-	flag               int
-	mu                 chan struct{}
-	writeLock          chan struct{}
-	concurrentWrites   chan struct{} //limit the goroutines waiting to write
-	calldepthOffset    int
-	prefix             string
-	host               string
-	token              string
-	buf                []byte
-	lastRefreshAt      time.Time
-	writeTimeout       time.Duration
+	conn             net.Conn
+	flag             int
+	mu               *sync.Mutex   // protects flag, prefix
+	connMu           *sync.Mutex   // protects conn, lastRefreshAt, buf; serializes writes
+	concurrentWrites chan struct{}  // semaphore; nil when unlimited
+	calldepthOffset  int
+	prefix           string
+	host             string
+	token            string
+	buf              []byte
+	lastRefreshAt    time.Time
+	writeTimeout     time.Duration
+	dialTimeout      time.Duration
+	tlsConfig        *tls.Config
 	_testWaitForWrite  *sync.WaitGroup
 	_testTimedoutWrite func()
-	wg                 *sync.WaitGroup
-	errOutput          io.Writer
-	errOutputMutex     *sync.RWMutex
-	numRetries         int
+	wg               *sync.WaitGroup
+	errOutput        io.Writer
+	errOutputMutex   *sync.RWMutex
+	numRetries       int
+	closed           int32 // atomic: 0=open, 1=closed
 }
 
 const lineSep = "\n"
 const maxLogLength int = 65000 //add 535 chars of headroom for the filename, timestamp and header
 var defaultWriteTimeout = 10 * time.Second
+var defaultDialTimeout = 10 * time.Second
 
 // Connect creates a new Logger instance and opens a TCP connection to
 // logentries.com,
@@ -75,21 +80,19 @@ func Connect(host, token string, concurrentWrites int, errOutput io.Writer, call
 }
 
 func newEmptyLogger(host, token string, calldepthOffset int) Logger {
-	l := Logger{
+	return Logger{
 		host:               host,
 		token:              token,
 		calldepthOffset:    calldepthOffset,
 		lastRefreshAt:      time.Now(),
 		writeTimeout:       defaultWriteTimeout,
-		writeLock:          make(chan struct{}, 1),
-		mu:                 make(chan struct{}, 1),
+		dialTimeout:        defaultDialTimeout,
+		mu:                 &sync.Mutex{},
+		connMu:             &sync.Mutex{},
 		_testTimedoutWrite: func() {}, //NOP for prod
 		wg:                 &sync.WaitGroup{},
 		errOutputMutex:     &sync.RWMutex{},
 	}
-	unlock(l.writeLock)
-	unlock(l.mu)
-	return l
 }
 
 func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
@@ -98,63 +101,48 @@ func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
 	logger.errOutput = errOutput
 }
 
-// Close closes the TCP connection to logentries.com
+// Close flushes pending writes and closes the TCP connection.
 func (logger *Logger) Close() error {
+	atomic.StoreInt32(&logger.closed, 1)
+	logger.wg.Wait()
+
+	logger.connMu.Lock()
+	defer logger.connMu.Unlock()
 	if logger.conn != nil {
 		return logger.conn.Close()
 	}
-
 	return nil
 }
 
-// Opens a TCP connection to logentries.com
+// openConnection opens a new TLS connection, closing any existing one first.
+// Caller must hold connMu (except during initial Connect).
 func (logger *Logger) openConnection() error {
-	conn, err := tls.Dial("tcp", logger.host, &tls.Config{})
+	if logger.conn != nil {
+		logger.conn.Close()
+	}
+
+	dialer := &net.Dialer{Timeout: logger.dialTimeout}
+	tlsCfg := &tls.Config{}
+	if logger.tlsConfig != nil {
+		tlsCfg = logger.tlsConfig
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", logger.host, tlsCfg)
 	if err != nil {
 		return err
 	}
 	logger.conn = conn
+	logger.lastRefreshAt = time.Now()
 	return nil
 }
 
-// It returns if the TCP connection to logentries.com is open
-func (logger *Logger) isOpenConnection() bool {
-	if logger.conn == nil {
-		return false
-	}
-
-	if time.Now().After(logger.lastRefreshAt.Add(15 * time.Minute)) {
-		logger.conn.Close()
-		return false
-	}
-
-	buf := make([]byte, 1)
-
-	logger.conn.SetReadDeadline(time.Now())
-
-	_, err := logger.conn.Read(buf)
-
-	switch err.(type) {
-	case net.Error:
-		if err.(net.Error).Timeout() == true {
-			logger.conn.SetReadDeadline(time.Time{})
-
-			return true
-		}
-	}
-
-	return false
-}
-
-// It ensures that the TCP connection to logentries.com is open.
-// If the connection is closed, a new one is opened.
+// ensureOpenConnection ensures the TCP connection is open.
+// If the connection is nil or stale (>15 min), it is refreshed.
+// Caller must hold connMu.
 func (logger *Logger) ensureOpenConnection() error {
-	if !logger.isOpenConnection() {
-		if err := logger.openConnection(); err != nil {
-			return err
-		}
+	if logger.conn == nil || time.Now().After(logger.lastRefreshAt.Add(15*time.Minute)) {
+		return logger.openConnection()
 	}
-
 	return nil
 }
 
@@ -175,19 +163,18 @@ func (logger *Logger) Fatalln(v ...interface{}) {
 
 // Flags returns the logger flags
 func (logger *Logger) Flags() int {
-	<-logger.mu
-	defer unlock(logger.mu)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	return logger.flag
 }
 
-// When we want to use errOutput, make sure it is not being modified in SetErrorOutput
+// writeToErrOutput writes to the error output, ensuring it is not being modified concurrently.
 func (l *Logger) writeToErrOutput(s string) {
 	l.errOutputMutex.RLock()
 	defer l.errOutputMutex.RUnlock()
-	fmt.Fprintf(l.errOutput, s)
+	fmt.Fprint(l.errOutput, s)
 }
 
-// Taken with slight modification from src/log/log.go
 // Output writes the output for a logging event. The string s contains
 // the text to print after the prefix specified by the flags of the
 // Logger. A newline is appended if the last character of s is not
@@ -196,6 +183,10 @@ func (l *Logger) writeToErrOutput(s string) {
 // paths it will be 3 plus a given offset.
 // Output does the actual writing to the TCP connection
 func (l *Logger) Output(calldepth int, s string, doAsync func()) {
+	if atomic.LoadInt32(&l.closed) != 0 {
+		return
+	}
+
 	defer func() {
 		if re := recover(); re != nil {
 			l.writeToErrOutput(fmt.Sprintf("Panicked in logger.output %v\n", re))
@@ -203,6 +194,7 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 			panic(re)
 		}
 	}()
+
 	if l.concurrentWrites != nil {
 		select {
 		case <-l.concurrentWrites:
@@ -210,48 +202,45 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 			return
 		}
 	}
+
 	now := time.Now() // get this early.
 	var file string
 	var line int
-	select {
-	case <-l.mu:
-	case <-time.After(l.writeTimeout):
-		l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu, wanted to log: %s", s))
-		l._testTimedoutWrite()
-		return
-	}
-	defer unlock(l.mu)
+
+	l.mu.Lock()
 	if l.flag&(log.Lshortfile|log.Llongfile) != 0 {
-		// Release lock while getting caller info - it's expensive.
-		unlock(l.mu)
+		l.mu.Unlock()
 		var ok bool
 		_, file, line, ok = runtime.Caller(calldepth)
 		if !ok {
 			file = "???"
 			line = 0
 		}
-		select {
-		case <-l.mu:
-		case <-time.After(l.writeTimeout):
-			l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s))
-			l._testTimedoutWrite()
-			return
-		}
+	} else {
+		l.mu.Unlock()
 	}
 
-	// Replace all but the trailing newline with `\u2028`
-	count := strings.Count(s, lineSep)
-	s = strings.Replace(s, lineSep, "\u2028", count-1)
+	// Replace embedded newlines with unicode line separator,
+	// stripping trailing newline (writeMessage always adds one per chunk).
+	s = replaceEmbeddedNewlines(s)
 
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		l.writeToLogEntries(s, file, now, line)
-		doAsync()
 		if l.concurrentWrites != nil {
-			l.concurrentWrites <- struct{}{}
+			defer func() { l.concurrentWrites <- struct{}{} }()
 		}
+		l.writeMessage(s, file, now, line)
+		doAsync()
 	}()
+}
+
+// replaceEmbeddedNewlines strips trailing newlines and replaces all remaining
+// newlines with the unicode line separator \u2028.
+func replaceEmbeddedNewlines(s string) string {
+	s = strings.TrimRight(s, lineSep)
+	s = strings.ReplaceAll(s, lineSep, "\u2028")
+	return s
 }
 
 func (l *Logger) Flush() {
@@ -285,8 +274,8 @@ func (logger *Logger) Panicln(v ...interface{}) {
 
 // Prefix returns the logger prefix
 func (logger *Logger) Prefix() string {
-	<-logger.mu
-	defer unlock(logger.mu)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	return logger.prefix
 }
 
@@ -307,8 +296,8 @@ func (logger *Logger) Println(v ...interface{}) {
 
 // SetFlags sets the logger flags
 func (logger *Logger) SetFlags(flag int) {
-	<-logger.mu
-	defer unlock(logger.mu)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	logger.flag = flag
 }
 
@@ -318,20 +307,28 @@ func (logger *Logger) SetNumberOfRetries(retries int) {
 
 // SetPrefix sets the logger prefix
 func (logger *Logger) SetPrefix(prefix string) {
-	<-logger.mu
-	defer unlock(logger.mu)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	logger.prefix = prefix
 }
 
 // Write writes a bytes array to the Logentries TCP connection,
-// it adds the access token and prefix and also replaces
-// line breaks with the unicode \u2028 character
+// it adds the access token and also ensures newline termination.
 func (logger *Logger) Write(p []byte) (n int, err error) {
-	if err := logger.ensureOpenConnection(); err != nil {
-		return 0, err
+	logger.connMu.Lock()
+	defer logger.connMu.Unlock()
+
+	var buf []byte
+	buf = append(buf, (logger.token + " ")...)
+	buf = append(buf, p...)
+	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
+		buf = append(buf, '\n')
 	}
 
-	return logger.conn.Write(p)
+	if err := logger.writeRaw(buf); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // Taken wholesale from src/log/log.go
@@ -404,22 +401,14 @@ func itoa(buf *[]byte, i int, wid int) {
 	*buf = append(*buf, b[bp:]...)
 }
 
-func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
-	select {
-	case <-l.writeLock:
-	case <-time.After(l.writeTimeout):
-		//Bail out here
-		l.writeToErrOutput(fmt.Sprintf("%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s))
-		l._testTimedoutWrite()
-		return
-	}
+// writeMessage formats and sends a log message, chunking if necessary.
+// Each chunk is prefixed with the token and header, and newline-terminated.
+func (l *Logger) writeMessage(s, file string, now time.Time, line int) {
+	l.connMu.Lock()
+	defer l.connMu.Unlock()
 
-	defer unlock(l.writeLock)
-
-	var i, n int
-	var err error
-
-	for i = 0; i < len(s); i = i + n {
+	i := 0
+	for {
 		end := i + maxLogLength - 2
 		if end > len(s) {
 			end = len(s)
@@ -428,36 +417,46 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 		l.buf = append(l.buf, (l.token + " ")...)
 		l.formatHeader(&l.buf, now, file, line)
 		l.buf = append(l.buf, s[i:end]...)
-		if len(s) == 0 || s[len(s)-1] != '\n' {
-			l.buf = append(l.buf, '\n')
-		}
-		err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
-		if err != nil {
-			log.Printf("le_go: Error setting write deadline: %s", err.Error())
-			log.Printf("Wanted to log: %s", s)
+		l.buf = append(l.buf, '\n')
+
+		if err := l.writeRaw(l.buf); err != nil {
+			l.writeToErrOutput(fmt.Sprintf("le_go: write error: %s, wanted to log: %s\n", err, s))
 			return
 		}
 
-		numAttempts := 1 + l.numRetries
-		for i := 0; i < numAttempts; i++ {
-			n, err = l.Write(l.buf)
-			if err != nil {
-				log.Printf("Error in write call: %s", err.Error())
-				log.Printf("Wanted to log: %s", s)
-				<-time.After(100 * time.Millisecond)
-				continue
-			}
+		if l._testWaitForWrite != nil {
+			l._testWaitForWrite.Done()
+		}
 
-			if l._testWaitForWrite != nil {
-				l._testWaitForWrite.Done()
-			}
+		i = end
+		if i >= len(s) {
 			break
 		}
-
-		if err != nil {
-			return
-		}
 	}
+}
+
+// writeRaw writes data to the TCP connection with retry logic.
+// Caller must hold connMu.
+func (l *Logger) writeRaw(data []byte) error {
+	numAttempts := 1 + l.numRetries
+	var err error
+	for attempt := 0; attempt < numAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if err = l.ensureOpenConnection(); err != nil {
+			continue
+		}
+		l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
+		_, err = l.conn.Write(data)
+		if err == nil {
+			return nil
+		}
+		// Force reconnect on next attempt
+		l.conn.Close()
+		l.conn = nil
+	}
+	return err
 }
 
 func handleFatalActions() {
@@ -472,8 +471,4 @@ func handlePanicActions(s string) func() {
 
 func handlePrintActions() {
 	return
-}
-
-func unlock(c chan struct{}) {
-	c <- struct{}{}
 }

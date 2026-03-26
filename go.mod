@@ -1,3 +1,3 @@
 module github.com/SpalkLtd/le_go
 
-go 1.18
+go 1.22.1
