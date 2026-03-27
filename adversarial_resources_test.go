@@ -41,11 +41,15 @@ func TestAdversarialSemaphoreStarvationAndRecovery(t *testing.T) {
 		t.Fatalf("expected %d semaphore tokens after flush, got %d (token leak)", semSize, available)
 	}
 
+	// Remove read delay for the recovery phase so the server reads promptly.
+	server.SetReadDelay(0)
+
 	// Now verify the logger is still functional — tokens recovered.
 	le.Print("recovery-message")
 	le.Flush()
 
-	waitForLines(t, server, 1, 5*time.Second) // at least 1 from recovery
+	// Wait for burst lines + recovery line to arrive at the server.
+	waitForLines(t, server, 3, 5*time.Second)
 	found := false
 	for _, line := range server.Lines() {
 		if strings.Contains(line, "recovery-message") {
@@ -434,8 +438,11 @@ func TestAdversarialSemaphoreRecoveryAfterBurst(t *testing.T) {
 	// Now send individual messages — each should succeed because tokens are back.
 	for i := 0; i < semSize; i++ {
 		le.Printf("post-burst-%d", i)
-		le.Flush()
 	}
+	le.Flush()
+
+	// Wait for all messages to be read by the server (burst + post-burst).
+	waitForLines(t, server, semSize+3, 5*time.Second) // at least burst lines + post-burst
 
 	// Verify post-burst messages arrived.
 	found := 0

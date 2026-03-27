@@ -104,6 +104,11 @@ func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
 // Close flushes pending writes and closes the TCP connection.
 func (logger *Logger) Close() error {
 	atomic.StoreInt32(&logger.closed, 1)
+	// Barrier: any Output() that already passed the closed check under mu
+	// has done wg.Add(1) before releasing mu. After we acquire+release mu,
+	// no new Add(1) can happen, so wg.Wait is safe.
+	logger.mu.Lock()
+	logger.mu.Unlock()
 	logger.wg.Wait()
 
 	logger.connMu.Lock()
@@ -183,10 +188,6 @@ func (l *Logger) writeToErrOutput(s string) {
 // paths it will be 3 plus a given offset.
 // Output does the actual writing to the TCP connection
 func (l *Logger) Output(calldepth int, s string, doAsync func()) {
-	if atomic.LoadInt32(&l.closed) != 0 {
-		return
-	}
-
 	defer func() {
 		if re := recover(); re != nil {
 			l.writeToErrOutput(fmt.Sprintf("Panicked in logger.output %v\n", re))
@@ -207,30 +208,41 @@ func (l *Logger) Output(calldepth int, s string, doAsync func()) {
 	var file string
 	var line int
 
+	// Hold mu for: closed check + wg.Add(1) + snapshot flag/prefix.
+	// This prevents wg.Add from racing with wg.Wait in Close/Flush
+	// (they acquire mu as a barrier before calling wg.Wait).
 	l.mu.Lock()
-	if l.flag&(log.Lshortfile|log.Llongfile) != 0 {
+	if atomic.LoadInt32(&l.closed) != 0 {
 		l.mu.Unlock()
+		if l.concurrentWrites != nil {
+			l.concurrentWrites <- struct{}{}
+		}
+		return
+	}
+	l.wg.Add(1)
+	flag := l.flag
+	prefix := l.prefix
+	l.mu.Unlock()
+
+	if flag&(log.Lshortfile|log.Llongfile) != 0 {
 		var ok bool
 		_, file, line, ok = runtime.Caller(calldepth)
 		if !ok {
 			file = "???"
 			line = 0
 		}
-	} else {
-		l.mu.Unlock()
 	}
 
 	// Replace embedded newlines with unicode line separator,
 	// stripping trailing newline (writeMessage always adds one per chunk).
 	s = replaceEmbeddedNewlines(s)
 
-	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
 		if l.concurrentWrites != nil {
 			defer func() { l.concurrentWrites <- struct{}{} }()
 		}
-		l.writeMessage(s, file, now, line)
+		l.writeMessage(s, file, now, line, flag, prefix)
 		doAsync()
 	}()
 }
@@ -251,6 +263,10 @@ func (l *Logger) Flush() {
 			log.Println("Recovered while flushing logs")
 		}
 	}()
+	// Barrier: ensure any in-flight Output() that passed closed check has
+	// completed wg.Add(1) before we call wg.Wait.
+	l.mu.Lock()
+	l.mu.Unlock()
 	l.wg.Wait()
 }
 
@@ -302,6 +318,8 @@ func (logger *Logger) SetFlags(flag int) {
 }
 
 func (logger *Logger) SetNumberOfRetries(retries int) {
+	logger.connMu.Lock()
+	defer logger.connMu.Unlock()
 	logger.numRetries = retries
 }
 
@@ -336,13 +354,13 @@ func (logger *Logger) Write(p []byte) (n int, err error) {
 //   - l.prefix (if it's not blank),
 //   - date and/or time (if corresponding flags are provided),
 //   - file and line number (if corresponding flags are provided).
-func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
-	*buf = append(*buf, l.prefix...)
-	if l.flag&(log.Ldate|log.Ltime|log.Lmicroseconds) != 0 {
-		if l.flag&log.LUTC != 0 {
+func formatHeader(buf *[]byte, t time.Time, file string, line int, flag int, prefix string) {
+	*buf = append(*buf, prefix...)
+	if flag&(log.Ldate|log.Ltime|log.Lmicroseconds) != 0 {
+		if flag&log.LUTC != 0 {
 			t = t.UTC()
 		}
-		if l.flag&log.Ldate != 0 {
+		if flag&log.Ldate != 0 {
 			year, month, day := t.Date()
 			itoa(buf, year, 4)
 			*buf = append(*buf, '/')
@@ -351,22 +369,22 @@ func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
 			itoa(buf, day, 2)
 			*buf = append(*buf, ' ')
 		}
-		if l.flag&(log.Ltime|log.Lmicroseconds) != 0 {
+		if flag&(log.Ltime|log.Lmicroseconds) != 0 {
 			hour, min, sec := t.Clock()
 			itoa(buf, hour, 2)
 			*buf = append(*buf, ':')
 			itoa(buf, min, 2)
 			*buf = append(*buf, ':')
 			itoa(buf, sec, 2)
-			if l.flag&log.Lmicroseconds != 0 {
+			if flag&log.Lmicroseconds != 0 {
 				*buf = append(*buf, '.')
 				itoa(buf, t.Nanosecond()/1e3, 6)
 			}
 			*buf = append(*buf, ' ')
 		}
 	}
-	if l.flag&(log.Lshortfile|log.Llongfile) != 0 {
-		if l.flag&log.Lshortfile != 0 {
+	if flag&(log.Lshortfile|log.Llongfile) != 0 {
+		if flag&log.Lshortfile != 0 {
 			short := file
 			for i := len(file) - 1; i > 0; i-- {
 				if file[i] == '/' {
@@ -403,7 +421,7 @@ func itoa(buf *[]byte, i int, wid int) {
 
 // writeMessage formats and sends a log message, chunking if necessary.
 // Each chunk is prefixed with the token and header, and newline-terminated.
-func (l *Logger) writeMessage(s, file string, now time.Time, line int) {
+func (l *Logger) writeMessage(s, file string, now time.Time, line int, flag int, prefix string) {
 	l.connMu.Lock()
 	defer l.connMu.Unlock()
 
@@ -415,7 +433,7 @@ func (l *Logger) writeMessage(s, file string, now time.Time, line int) {
 		}
 		l.buf = l.buf[:0]
 		l.buf = append(l.buf, (l.token + " ")...)
-		l.formatHeader(&l.buf, now, file, line)
+		formatHeader(&l.buf, now, file, line, flag, prefix)
 		l.buf = append(l.buf, s[i:end]...)
 		l.buf = append(l.buf, '\n')
 
