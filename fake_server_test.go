@@ -180,7 +180,7 @@ func connectToFakeServer(t *testing.T, s *fakeLogentriesServer, concurrentWrites
 	logger.conn = conn
 	logger.lastRefreshAt = time.Now()
 
-	return &logger
+	return logger
 }
 
 type discardWriter struct{}

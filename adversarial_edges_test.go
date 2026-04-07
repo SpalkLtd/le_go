@@ -421,7 +421,7 @@ func TestAdversarialTokenWithNewlines(t *testing.T) {
 	}
 	logger.conn = conn
 	logger.lastRefreshAt = time.Now()
-	le := &logger
+	le := logger
 
 	defer le.Close()
 
@@ -456,7 +456,7 @@ func TestAdversarialTokenWithNullBytes(t *testing.T) {
 	}
 	logger.conn = conn
 	logger.lastRefreshAt = time.Now()
-	le := &logger
+	le := logger
 
 	defer le.Close()
 
@@ -618,7 +618,7 @@ func TestAdversarialNegativeCalldepthOffset(t *testing.T) {
 	}
 	logger.conn = conn
 	logger.lastRefreshAt = time.Now()
-	le := &logger
+	le := logger
 	defer le.Close()
 
 	// runtime.Caller with negative skip — should return ok=false
@@ -648,7 +648,7 @@ func TestAdversarialVeryLargeCalldepthOffset(t *testing.T) {
 	}
 	logger.conn = conn
 	logger.lastRefreshAt = time.Now()
-	le := &logger
+	le := logger
 	defer le.Close()
 
 	le.Print("huge calldepth")

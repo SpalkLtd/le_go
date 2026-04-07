@@ -88,10 +88,12 @@ func TestCloseClosesConnection(t *testing.T) {
 	le := connectToFakeServer(t, server, 0, nil)
 	le.Close()
 
-	// Writing to a closed connection should fail
-	_, err := le.conn.Write([]byte("test"))
-	if err == nil {
-		t.Fatal("expected error writing to closed connection")
+	// Close should release and clear the underlying connection so that no
+	// subsequent operation can use it.
+	le.connMu.Lock()
+	defer le.connMu.Unlock()
+	if le.conn != nil {
+		t.Fatal("expected le.conn to be nil after Close")
 	}
 }
 
@@ -699,7 +701,7 @@ func TestWriteToErrOutputWithPercent(t *testing.T) {
 	var errBuf bytes.Buffer
 	le := newEmptyLogger("", "test-token", 0)
 	le.errOutput = &errBuf
-	le.errOutputMutex = &sync.RWMutex{}
+	le.errOutputMutex = &sync.Mutex{}
 
 	// Call writeToErrOutput with a string containing format verbs
 	le.writeToErrOutput("100% complete %s %d")
