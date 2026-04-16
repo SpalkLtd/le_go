@@ -14,4 +14,4 @@
  - Allow error output to be set
  - Ensure that when we are using errorOutput, it is threadsafe
  - Add retries 
- - Fix connection storm: update lastRefreshAt on reconnect so connections are reused past 15 minutes
+ - Fix connection storm
