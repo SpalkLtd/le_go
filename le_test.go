@@ -1,8 +1,15 @@
 package le_go
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -11,92 +18,181 @@ import (
 	"time"
 )
 
-func TestConnectOpensConnection(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "", 0, nil, 0)
+// newTestLogger creates a Logger with a fakeConnection, suitable for tests
+// that don't need real network connectivity.
+func newTestLogger(token string, concurrentWrites int) *Logger {
+	l := newEmptyLogger("", token, 0)
+	l.conn = &fakeConnection{}
+	l.errOutput = io.Discard
+	if concurrentWrites > 0 {
+		l.concurrentWrites = make(chan struct{}, concurrentWrites)
+		for i := 0; i < concurrentWrites; i++ {
+			l.concurrentWrites <- struct{}{}
+		}
+	}
+	return &l
+}
+
+// startTLSServer starts a local TLS server for testing Connect/openConnection.
+// Returns the server address and a client tls.Config that trusts the server's cert.
+func startTLSServer(t *testing.T) (addr string, clientConfig *tls.Config) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept connections in the background. Track them so we can close them
+	// on cleanup — but keep them open during the test so the TLS handshake
+	// completes on the client side.
+	var (
+		connMu sync.Mutex
+		conns  []net.Conn
+	)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connMu.Lock()
+			conns = append(conns, conn)
+			connMu.Unlock()
+			// Complete the TLS handshake so the client's tls.Dial returns.
+			if tlsConn, ok := conn.(*tls.Conn); ok {
+				_ = tlsConn.Handshake()
+			}
+		}
+	}()
+
+	t.Cleanup(func() {
+		listener.Close()
+		connMu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		connMu.Unlock()
+	})
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(certPEM)
+
+	return listener.Addr().String(), &tls.Config{RootCAs: pool}
+}
+
+func TestConnectOpensConnection(t *testing.T) {
+	addr, clientConfig := startTLSServer(t)
+
+	// Connect uses a default tls.Config that won't trust our self-signed
+	// cert, so we set up the logger manually and call openConnection — the
+	// same code path Connect takes.
+	le := newEmptyLogger(addr, "", 0)
+	le.tlsConfig = clientConfig
+
+	if err := le.openConnection(); err != nil {
+		t.Fatal(err)
+	}
 	defer le.Close()
 
 	if le.conn == nil {
-		t.Fail()
-	}
-
-	if le.conn == nil {
-		t.Fail()
+		t.Fatal("expected conn to be non-nil after openConnection")
 	}
 }
 
 func TestConnectSetsToken(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer le.Close()
+	le := newTestLogger("myToken", 0)
 
 	if le.token != "myToken" {
-		t.Fail()
+		t.Fatalf("expected token 'myToken', got '%s'", le.token)
 	}
 }
 
 func TestCloseClosesConnection(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("", 0)
 
 	le.Close()
 
 	if le.conn != nil {
-		t.Fail()
+		t.Fatal("expected conn to be nil after Close")
 	}
 }
 
 func TestOpenConnectionOpensConnection(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "", 0, nil, 0)
-	if err != nil {
+	addr, clientConfig := startTLSServer(t)
+
+	le := newEmptyLogger(addr, "", 0)
+	le.tlsConfig = clientConfig
+
+	if err := le.openConnection(); err != nil {
 		t.Fatal(err)
 	}
-
 	defer le.Close()
 
-	le.openConnection()
-
 	if le.conn == nil {
-		t.Fail()
+		t.Fatal("expected conn to be non-nil after openConnection")
 	}
 }
 
 func TestEnsureOpenConnectionDoesNothingOnOpenConnection(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("", 0)
+	existingConn := le.conn
 
-	defer le.Close()
-	old := &le.conn
+	le.ensureOpenConnection()
 
-	le.openConnection()
-
-	if old != &le.conn {
-		t.Fail()
+	if le.conn != existingConn {
+		t.Fatal("expected ensureOpenConnection to keep existing conn")
 	}
 }
 
 func TestEnsureOpenConnectionCreatesNewConnection(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
+	addr, clientConfig := startTLSServer(t)
+
+	le := newEmptyLogger(addr, "", 0)
+	le.tlsConfig = clientConfig
+	// conn starts nil
+	if le.conn != nil {
+		t.Fatal("expected conn to start nil")
 	}
 
+	if err := le.ensureOpenConnection(); err != nil {
+		t.Fatal(err)
+	}
 	defer le.Close()
 
-	le.openConnection()
-
 	if le.conn == nil {
-		t.Fail()
+		t.Fatal("expected conn to be non-nil after ensureOpenConnection")
 	}
 }
 
@@ -141,11 +237,7 @@ func TestSetPrefixSetsPrefix(t *testing.T) {
 }
 
 func TestLoggerImplementsWriterInterface(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	le := newTestLogger("myToken", 0)
 	defer le.Close()
 
 	// the test will fail to compile if Logger doesn't implement io.Writer
@@ -153,15 +245,11 @@ func TestLoggerImplementsWriterInterface(t *testing.T) {
 }
 
 func TestReplaceNewline(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("myToken", 0)
+	defer le.Close()
 
 	le._testWaitForWrite = &sync.WaitGroup{}
 	le._testWaitForWrite.Add(1)
-
-	defer le.Close()
 
 	le.Println("1\n2\n3")
 
@@ -173,15 +261,11 @@ func TestReplaceNewline(t *testing.T) {
 }
 
 func TestAddNewline(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("myToken", 0)
+	defer le.Close()
 
 	le._testWaitForWrite = &sync.WaitGroup{}
 	le._testWaitForWrite.Add(1)
-
-	defer le.Close()
 
 	le.Print("123")
 
@@ -203,15 +287,11 @@ func TestAddNewline(t *testing.T) {
 }
 
 func TestCanSendMoreThan64k(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("myToken", 0)
+	defer le.Close()
 
 	le._testWaitForWrite = &sync.WaitGroup{}
 	le._testWaitForWrite.Add(3) // 3 because we need to write 3 times since it exceeds the limit (64k)
-
-	defer le.Close()
 
 	longBytes := make([]byte, 140000)
 	for i := 0; i < 140000; i++ {
@@ -231,10 +311,9 @@ func TestCanSendMoreThan64k(t *testing.T) {
 }
 
 func TestTimeoutWrites(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 0, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("myToken", 0)
+	defer le.Close()
+
 	timedoutCount := 0
 	le._testTimedoutWrite = func() {
 		timedoutCount++
@@ -242,8 +321,6 @@ func TestTimeoutWrites(t *testing.T) {
 
 	le._testWaitForWrite = &sync.WaitGroup{}
 	le._testWaitForWrite.Add(1)
-
-	defer le.Close()
 
 	b := make([]byte, 1000)
 	for i := 0; i < 1000; i++ {
@@ -269,10 +346,9 @@ func TestTimeoutWrites(t *testing.T) {
 }
 
 func TestLimitedConcurrentWrites(t *testing.T) {
-	le, err := Connect("data.logentries.com:443", "myToken", 3, io.Discard, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	le := newTestLogger("myToken", 3)
+	defer le.Close()
+
 	timedoutCount := 0
 	le._testTimedoutWrite = func() {
 		timedoutCount++
@@ -280,8 +356,6 @@ func TestLimitedConcurrentWrites(t *testing.T) {
 
 	le._testWaitForWrite = &sync.WaitGroup{}
 	le._testWaitForWrite.Add(1)
-
-	defer le.Close()
 
 	b := make([]byte, 1000)
 	for i := 0; i < 1000; i++ {
@@ -383,28 +457,3 @@ func ExampleLogger_write() {
 
 	fmt.Fprintln(le, "another test message")
 }
-
-// func BenchmarkMakeBuf(b *testing.B) {
-// 	le := Logger{token: "token"}
-
-// 	for i := 0; i < b.N; i++ {
-// 		le.makeBuf([]byte("test\nstring\n"))
-// 	}
-// }
-
-// func BenchmarkMakeBufWithoutNewlineSuffix(b *testing.B) {
-// 	le := Logger{token: "token"}
-
-// 	for i := 0; i < b.N; i++ {
-// 		le.makeBuf([]byte("test\nstring"))
-// 	}
-// }
-
-// func BenchmarkMakeBufWithPrefix(b *testing.B) {
-// 	le := Logger{token: "token"}
-// 	le.SetPrefix("prefix")
-
-// 	for i := 0; i < b.N; i++ {
-// 		le.makeBuf([]byte("test\nstring\n"))
-// 	}
-// }

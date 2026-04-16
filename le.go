@@ -42,6 +42,7 @@ type Logger struct {
 	errOutput          io.Writer
 	errOutputMutex     *sync.RWMutex
 	numRetries         int
+	tlsConfig          *tls.Config
 }
 
 const lineSep = "\n"
@@ -109,7 +110,11 @@ func (logger *Logger) Close() error {
 
 // openConnection opens a new TLS connection to logentries.com.
 func (logger *Logger) openConnection() error {
-	conn, err := tls.Dial("tcp", logger.host, &tls.Config{})
+	cfg := logger.tlsConfig
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	conn, err := tls.Dial("tcp", logger.host, cfg)
 	if err != nil {
 		return err
 	}
@@ -408,16 +413,26 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 		if len(s) == 0 || s[len(s)-1] != '\n' {
 			l.buf = append(l.buf, '\n')
 		}
-		err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
-		if err != nil {
-			log.Printf("le_go: Error setting write deadline: %s", err.Error())
-			log.Printf("Wanted to log: %s", s)
-			return
-		}
-
 		numAttempts := 1 + l.numRetries
 		for i := 0; i < numAttempts; i++ {
-			n, err = l.Write(l.buf)
+			if err = l.ensureOpenConnection(); err != nil {
+				log.Printf("le_go: Error reconnecting: %s", err.Error())
+				log.Printf("Wanted to log: %s", s)
+				// Always allow at least one reconnect attempt so a
+				// stale connection doesn't silently discard the log.
+				if numAttempts < 2 {
+					numAttempts = 2
+				}
+				<-time.After(100 * time.Millisecond)
+				continue
+			}
+			err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
+			if err != nil {
+				log.Printf("le_go: Error setting write deadline: %s", err.Error())
+				log.Printf("Wanted to log: %s", s)
+				return
+			}
+			n, err = l.conn.Write(l.buf)
 			if err != nil {
 				log.Printf("Error in write call: %s", err.Error())
 				log.Printf("Wanted to log: %s", s)
@@ -425,6 +440,11 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 				if l.conn != nil {
 					l.conn.Close()
 					l.conn = nil
+				}
+				// Always allow at least one reconnect attempt so a
+				// stale connection doesn't silently discard the log.
+				if numAttempts < 2 {
+					numAttempts = 2
 				}
 				<-time.After(100 * time.Millisecond)
 				continue
