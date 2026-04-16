@@ -14,4 +14,4 @@
  - Allow error output to be set
  - Ensure that when we are using errorOutput, it is threadsafe
  - Add retries 
- - Fix connection storm
+ - Replace 15-minute forced reconnect with TCP keepalive

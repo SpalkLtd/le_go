@@ -35,7 +35,6 @@ type Logger struct {
 	host               string
 	token              string
 	buf                []byte
-	lastRefreshAt      time.Time
 	writeTimeout       time.Duration
 	_testWaitForWrite  *sync.WaitGroup
 	_testTimedoutWrite func()
@@ -79,7 +78,6 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 		host:               host,
 		token:              token,
 		calldepthOffset:    calldepthOffset,
-		lastRefreshAt:      time.Now(),
 		writeTimeout:       defaultWriteTimeout,
 		writeLock:          make(chan struct{}, 1),
 		mu:                 make(chan struct{}, 1),
@@ -113,19 +111,17 @@ func (logger *Logger) openConnection() error {
 	if err != nil {
 		return err
 	}
+	if tc, ok := conn.NetConn().(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 	logger.conn = conn
-	logger.lastRefreshAt = time.Now()
 	return nil
 }
 
 // It returns if the TCP connection to logentries.com is open
 func (logger *Logger) isOpenConnection() bool {
 	if logger.conn == nil {
-		return false
-	}
-
-	if time.Now().After(logger.lastRefreshAt.Add(15 * time.Minute)) {
-		logger.conn.Close()
 		return false
 	}
 
