@@ -35,7 +35,6 @@ type Logger struct {
 	host               string
 	token              string
 	buf                []byte
-	lastRefreshAt      time.Time
 	writeTimeout       time.Duration
 	_testWaitForWrite  *sync.WaitGroup
 	_testTimedoutWrite func()
@@ -43,6 +42,7 @@ type Logger struct {
 	errOutput          io.Writer
 	errOutputMutex     *sync.RWMutex
 	numRetries         int
+	tlsConfig          *tls.Config
 }
 
 const lineSep = "\n"
@@ -79,7 +79,6 @@ func newEmptyLogger(host, token string, calldepthOffset int) Logger {
 		host:               host,
 		token:              token,
 		calldepthOffset:    calldepthOffset,
-		lastRefreshAt:      time.Now(),
 		writeTimeout:       defaultWriteTimeout,
 		writeLock:          make(chan struct{}, 1),
 		mu:                 make(chan struct{}, 1),
@@ -101,15 +100,21 @@ func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
 // Close closes the TCP connection to logentries.com
 func (logger *Logger) Close() error {
 	if logger.conn != nil {
-		return logger.conn.Close()
+		err := logger.conn.Close()
+		logger.conn = nil
+		return err
 	}
 
 	return nil
 }
 
-// Opens a TCP connection to logentries.com
+// openConnection opens a new TLS connection to logentries.com.
 func (logger *Logger) openConnection() error {
-	conn, err := tls.Dial("tcp", logger.host, &tls.Config{})
+	cfg := logger.tlsConfig
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	conn, err := tls.Dial("tcp", logger.host, cfg)
 	if err != nil {
 		return err
 	}
@@ -117,44 +122,15 @@ func (logger *Logger) openConnection() error {
 	return nil
 }
 
-// It returns if the TCP connection to logentries.com is open
-func (logger *Logger) isOpenConnection() bool {
-	if logger.conn == nil {
-		return false
-	}
-
-	if time.Now().After(logger.lastRefreshAt.Add(15 * time.Minute)) {
-		logger.conn.Close()
-		return false
-	}
-
-	buf := make([]byte, 1)
-
-	logger.conn.SetReadDeadline(time.Now())
-
-	_, err := logger.conn.Read(buf)
-
-	switch err.(type) {
-	case net.Error:
-		if err.(net.Error).Timeout() == true {
-			logger.conn.SetReadDeadline(time.Time{})
-
-			return true
-		}
-	}
-
-	return false
-}
-
-// It ensures that the TCP connection to logentries.com is open.
-// If the connection is closed, a new one is opened.
+// ensureOpenConnection reconnects if conn is nil. Matches the
+// write-fail-then-reconnect pattern used by Rapid7's official clients:
+//   https://github.com/rapid7/r7insight_node
+//   https://github.com/rapid7/r7insight_python
+//   https://github.com/rapid7/r7insight_java
 func (logger *Logger) ensureOpenConnection() error {
-	if !logger.isOpenConnection() {
-		if err := logger.openConnection(); err != nil {
-			return err
-		}
+	if logger.conn == nil {
+		return logger.openConnection()
 	}
-
 	return nil
 }
 
@@ -431,19 +407,34 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 		if len(s) == 0 || s[len(s)-1] != '\n' {
 			l.buf = append(l.buf, '\n')
 		}
-		err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
-		if err != nil {
-			log.Printf("le_go: Error setting write deadline: %s", err.Error())
-			log.Printf("Wanted to log: %s", s)
-			return
-		}
-
 		numAttempts := 1 + l.numRetries
 		for i := 0; i < numAttempts; i++ {
-			n, err = l.Write(l.buf)
+			if err = l.ensureOpenConnection(); err != nil {
+				// Ensure at least one retry so a stale conn doesn't drop the log.
+				if numAttempts < 2 {
+					numAttempts = 2
+				}
+				<-time.After(100 * time.Millisecond)
+				continue
+			}
+			err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
+			if err != nil {
+				log.Printf("le_go: Error setting write deadline: %s", err.Error())
+				log.Printf("Wanted to log: %s", s)
+				return
+			}
+			n, err = l.conn.Write(l.buf)
 			if err != nil {
 				log.Printf("Error in write call: %s", err.Error())
 				log.Printf("Wanted to log: %s", s)
+				// Nil the conn so ensureOpenConnection reconnects on retry.
+				if l.conn != nil {
+					l.conn.Close()
+					l.conn = nil
+				}
+				if numAttempts < 2 {
+					numAttempts = 2
+				}
 				<-time.After(100 * time.Millisecond)
 				continue
 			}
