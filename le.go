@@ -122,17 +122,11 @@ func (logger *Logger) openConnection() error {
 	return nil
 }
 
-// ensureOpenConnection reconnects if the connection has been nil'd out
-// (e.g. after a write failure or Close).
-//
-// Connection strategy: we don't probe or force-refresh the connection.
-// Instead we follow the same pattern used by Rapid7's official clients
-// (r7insight_node, r7insight_python, r7insight_java): just write, and
-// if it fails, nil the conn and reconnect on the next attempt. None of
-// the official clients use TCP keepalive or periodic reconnects.
-// See: https://github.com/rapid7/r7insight_node
-//      https://github.com/rapid7/r7insight_python
-//      https://github.com/rapid7/r7insight_java
+// ensureOpenConnection reconnects if conn is nil. Matches the
+// write-fail-then-reconnect pattern used by Rapid7's official clients:
+//   https://github.com/rapid7/r7insight_node
+//   https://github.com/rapid7/r7insight_python
+//   https://github.com/rapid7/r7insight_java
 func (logger *Logger) ensureOpenConnection() error {
 	if logger.conn == nil {
 		return logger.openConnection()
@@ -416,10 +410,7 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 		numAttempts := 1 + l.numRetries
 		for i := 0; i < numAttempts; i++ {
 			if err = l.ensureOpenConnection(); err != nil {
-				log.Printf("le_go: Error reconnecting: %s", err.Error())
-				log.Printf("Wanted to log: %s", s)
-				// Always allow at least one reconnect attempt so a
-				// stale connection doesn't silently discard the log.
+				// Ensure at least one retry so a stale conn doesn't drop the log.
 				if numAttempts < 2 {
 					numAttempts = 2
 				}
@@ -441,8 +432,6 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 					l.conn.Close()
 					l.conn = nil
 				}
-				// Always allow at least one reconnect attempt so a
-				// stale connection doesn't silently discard the log.
 				if numAttempts < 2 {
 					numAttempts = 2
 				}
