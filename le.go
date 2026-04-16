@@ -114,6 +114,7 @@ func (logger *Logger) openConnection() error {
 		return err
 	}
 	logger.conn = conn
+	logger.lastRefreshAt = time.Now()
 	return nil
 }
 
