@@ -23,7 +23,7 @@ func TestConnectOpensConnection(t *testing.T) {
 		t.Fail()
 	}
 
-	if le.isOpenConnection() == false {
+	if le.conn == nil {
 		t.Fail()
 	}
 }
@@ -49,7 +49,7 @@ func TestCloseClosesConnection(t *testing.T) {
 
 	le.Close()
 
-	if le.isOpenConnection() == true {
+	if le.conn != nil {
 		t.Fail()
 	}
 }
@@ -64,7 +64,7 @@ func TestOpenConnectionOpensConnection(t *testing.T) {
 
 	le.openConnection()
 
-	if le.isOpenConnection() == false {
+	if le.conn == nil {
 		t.Fail()
 	}
 }
@@ -95,7 +95,7 @@ func TestEnsureOpenConnectionCreatesNewConnection(t *testing.T) {
 
 	le.openConnection()
 
-	if le.isOpenConnection() == false {
+	if le.conn == nil {
 		t.Fail()
 	}
 }

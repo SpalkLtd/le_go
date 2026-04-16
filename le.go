@@ -99,59 +99,39 @@ func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
 // Close closes the TCP connection to logentries.com
 func (logger *Logger) Close() error {
 	if logger.conn != nil {
-		return logger.conn.Close()
+		err := logger.conn.Close()
+		logger.conn = nil
+		return err
 	}
 
 	return nil
 }
 
-// Opens a TCP connection to logentries.com
+// openConnection opens a new TLS connection to logentries.com.
 func (logger *Logger) openConnection() error {
 	conn, err := tls.Dial("tcp", logger.host, &tls.Config{})
 	if err != nil {
 		return err
 	}
-	if tc, ok := conn.NetConn().(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
 	logger.conn = conn
 	return nil
 }
 
-// It returns if the TCP connection to logentries.com is open
-func (logger *Logger) isOpenConnection() bool {
-	if logger.conn == nil {
-		return false
-	}
-
-	buf := make([]byte, 1)
-
-	logger.conn.SetReadDeadline(time.Now())
-
-	_, err := logger.conn.Read(buf)
-
-	switch err.(type) {
-	case net.Error:
-		if err.(net.Error).Timeout() == true {
-			logger.conn.SetReadDeadline(time.Time{})
-
-			return true
-		}
-	}
-
-	return false
-}
-
-// It ensures that the TCP connection to logentries.com is open.
-// If the connection is closed, a new one is opened.
+// ensureOpenConnection reconnects if the connection has been nil'd out
+// (e.g. after a write failure or Close).
+//
+// Connection strategy: we don't probe or force-refresh the connection.
+// Instead we follow the same pattern used by Rapid7's official clients
+// (r7insight_node, r7insight_python, r7insight_java): just write, and
+// if it fails, nil the conn and reconnect on the next attempt. None of
+// the official clients use TCP keepalive or periodic reconnects.
+// See: https://github.com/rapid7/r7insight_node
+//      https://github.com/rapid7/r7insight_python
+//      https://github.com/rapid7/r7insight_java
 func (logger *Logger) ensureOpenConnection() error {
-	if !logger.isOpenConnection() {
-		if err := logger.openConnection(); err != nil {
-			return err
-		}
+	if logger.conn == nil {
+		return logger.openConnection()
 	}
-
 	return nil
 }
 
@@ -441,6 +421,11 @@ func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
 			if err != nil {
 				log.Printf("Error in write call: %s", err.Error())
 				log.Printf("Wanted to log: %s", s)
+				// Nil the conn so ensureOpenConnection reconnects on retry.
+				if l.conn != nil {
+					l.conn.Close()
+					l.conn = nil
+				}
 				<-time.After(100 * time.Millisecond)
 				continue
 			}
