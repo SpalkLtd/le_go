@@ -13,5 +13,4 @@
  - Add `calldepthOffset` param to allow users to change the calldepth that is logged
  - Allow error output to be set
  - Ensure that when we are using errorOutput, it is threadsafe
- - Add retries 
  - Replace 15-minute forced reconnect with TCP keepalive
