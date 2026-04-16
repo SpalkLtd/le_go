@@ -1,351 +1,611 @@
 // Package le_go provides a Golang client library for logging to
-// logentries.com over a TCP connection.
+// logentries.com over a TLS connection using an access token.
 //
-// it uses an access token for sending log events.
+// # Architecture
+//
+// Print-family methods (Print, Printf, Println) dispatch log entries
+// asynchronously via a bounded channel to a single consumer goroutine.
+// When the channel is full, entries are dropped and counted (see Stats).
+// Within the Print path, FIFO ordering is guaranteed.
+//
+// Write (io.Writer), Fatal, and Panic use a direct synchronous path
+// that acquires the connection mutex independently of the Print queue.
+// Write is decoupled from Print queue depth. Fatal and Panic use a
+// bounded TryLock (500ms) to avoid blocking the crash path.
+//
+// # Behavior changes from prior versions
+//
+//   - Write now prepends the access token and appends a trailing newline.
+//     Previously Write was a raw passthrough to the TCP connection.
+//   - Write now chunks payloads exceeding 65000 bytes, consistent with Print.
+//   - Fatal and Panic are synchronous in the caller goroutine. Fatal writes
+//     before os.Exit; Panic panics in the caller's stack frame (recoverable
+//     via defer recover). Previously both ran asynchronously in detached
+//     goroutines.
+//   - Under sustained connection-mutex contention, Fatal/Panic may exit or
+//     panic without writing the log message. See Stats().DroppedSyncLock.
+//   - Close is idempotent (second call returns nil) and blocks until the
+//     async queue is drained.
+//   - Write and Flush return ErrLoggerClosed after Close.
+//   - Print calls that race with Close may be silently dropped. For
+//     guaranteed delivery before shutdown, call Flush() and check its
+//     error return before calling Close().
+//   - Connection reuse now works correctly beyond 15 minutes of process
+//     uptime (fixes a connection-storm bug in prior versions).
+//   - Half-open TCP detection uses OS-level keepalive (30s period) instead
+//     of a per-call application-level read probe. Middleboxes may swallow
+//     keepalive probes; keep writeTimeout short for backup detection.
+//   - errOutput no longer emits "Timedout waiting for logger.mu" diagnostics;
+//     the mu-timeout path has been removed.
+//   - On retry after partial TCP write, Write may under-report bytes written.
+//   - errOutput should be non-blocking; a slow errOutput writer blocks all
+//     log paths.
+//   - Flush() now returns error (previously void). Existing callers that
+//     discarded the return continue to compile.
+//   - The concurrentWrites parameter to Connect now controls the channel
+//     buffer capacity rather than a goroutine semaphore. When 0, defaults
+//     to 4096.
 package le_go
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Logger represents a Logentries logger,
-// it holds the open TCP connection, access token, prefix and flags.
-//
-// all Logger operations are thread safe and blocking,
-// log operations can be invoked in a non-blocking way by calling them from
-// a goroutine.
+var ErrLoggerClosed = errors.New("le_go: logger is closed")
+
+type DropReason int
+
+const (
+	DropQueueFull DropReason = iota
+	DropClosed
+	DropSyncLock
+)
+
+type Stats struct {
+	DroppedQueueFull uint64
+	DroppedClosed    uint64
+	DroppedSyncLock  uint64
+	PanicsRecovered  uint64
+}
+
+type Option func(*Logger)
+
+type entry struct {
+	s          string
+	file       string
+	prefix     string
+	now        time.Time
+	line       int
+	flag       int
+	numRetries int
+
+	flush bool
+	ack   chan error
+}
+
 type Logger struct {
-	conn               net.Conn
-	flag               int
-	mu                 chan struct{}
-	writeLock          chan struct{}
-	concurrentWrites   chan struct{} //limit the goroutines waiting to write
-	calldepthOffset    int
-	prefix             string
-	host               string
-	token              string
-	buf                []byte
-	lastRefreshAt      time.Time
-	writeTimeout       time.Duration
-	_testWaitForWrite  *sync.WaitGroup
-	_testTimedoutWrite func()
-	wg                 *sync.WaitGroup
-	errOutput          io.Writer
-	errOutputMutex     *sync.RWMutex
-	numRetries         int
+	cfgMu      sync.Mutex
+	flag       int
+	prefix     string
+	numRetries int
+
+	host            string
+	token           string
+	calldepthOffset int
+	writeTimeout    time.Duration
+	dialTimeout     time.Duration
+	tlsConfig       *tls.Config
+
+	errOutputMutex sync.Mutex
+	errOutput      io.Writer
+
+	ch      chan entry
+	done    chan struct{}
+	exited  chan struct{}
+	closed  atomic.Bool
+	droppedQueueFull atomic.Uint64
+	droppedClosed    atomic.Uint64
+	droppedSyncLock  atomic.Uint64
+	panicsRecovered  atomic.Uint64
+
+	connMu        sync.Mutex
+	conn          net.Conn
+	lastRefreshAt time.Time
+
+	_testWaitForWrite *sync.WaitGroup
+	_testDropped      func(DropReason)
 }
 
 const lineSep = "\n"
-const maxLogLength int = 65000 //add 535 chars of headroom for the filename, timestamp and header
+const maxLogLength int = 65000
+const retryBackoff = 100 * time.Millisecond
+const fatalLockWait = 500 * time.Millisecond
+const maxConsecutivePanics = 10
+
 var defaultWriteTimeout = 10 * time.Second
+var defaultDialTimeout = 10 * time.Second
 
-// Connect creates a new Logger instance and opens a TCP connection to
-// logentries.com,
-// The token can be generated at logentries.com by adding a new log,
-// choosing manual configuration and token based TCP connection.
-func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int) (*Logger, error) {
-	logger := newEmptyLogger(host, token, calldepthOffset)
-	if concurrentWrites > 0 {
-		logger.concurrentWrites = make(chan struct{}, concurrentWrites)
-		for i := 0; i < concurrentWrites; i++ {
-			logger.concurrentWrites <- struct{}{}
-		}
+// Connect creates a new Logger instance and opens a TLS connection.
+// The concurrentWrites parameter controls the async channel buffer capacity;
+// 0 defaults to 4096. Optional Option values configure test hooks and timeouts.
+func Connect(host, token string, concurrentWrites int, errOutput io.Writer, calldepthOffset int, opts ...Option) (*Logger, error) {
+	capacity := concurrentWrites
+	if capacity <= 0 {
+		capacity = 4096
 	}
+
+	l := &Logger{
+		host:            host,
+		token:           token,
+		calldepthOffset: calldepthOffset,
+		writeTimeout:    defaultWriteTimeout,
+		dialTimeout:     defaultDialTimeout,
+		ch:              make(chan entry, capacity),
+		done:            make(chan struct{}),
+		exited:          make(chan struct{}),
+		lastRefreshAt:   time.Now(),
+		_testDropped:    func(DropReason) {},
+	}
+
 	if errOutput != nil {
-		logger.errOutput = errOutput
+		l.errOutput = errOutput
 	} else {
-		logger.errOutput = os.Stdout
+		l.errOutput = os.Stdout
 	}
 
-	if err := logger.openConnection(); err != nil {
+	for _, opt := range opts {
+		opt(l)
+	}
+
+	if err := l.openConnectionLocked(); err != nil {
 		return nil, err
 	}
 
-	return &logger, nil
+	go l.run()
+	return l, nil
 }
 
-func newEmptyLogger(host, token string, calldepthOffset int) Logger {
-	l := Logger{
-		host:               host,
-		token:              token,
-		calldepthOffset:    calldepthOffset,
-		lastRefreshAt:      time.Now(),
-		writeTimeout:       defaultWriteTimeout,
-		writeLock:          make(chan struct{}, 1),
-		mu:                 make(chan struct{}, 1),
-		_testTimedoutWrite: func() {}, //NOP for prod
-		wg:                 &sync.WaitGroup{},
-		errOutputMutex:     &sync.RWMutex{},
+func WithTestWaitForWrite(wg *sync.WaitGroup) Option {
+	return func(l *Logger) { l._testWaitForWrite = wg }
+}
+
+func WithTestDropped(fn func(DropReason)) Option {
+	return func(l *Logger) { l._testDropped = fn }
+}
+
+func WithDialTimeout(d time.Duration) Option {
+	return func(l *Logger) { l.dialTimeout = d }
+}
+
+func WithWriteTimeout(d time.Duration) Option {
+	return func(l *Logger) { l.writeTimeout = d }
+}
+
+func (l *Logger) Stats() Stats {
+	return Stats{
+		DroppedQueueFull: l.droppedQueueFull.Load(),
+		DroppedClosed:    l.droppedClosed.Load(),
+		DroppedSyncLock:  l.droppedSyncLock.Load(),
+		PanicsRecovered:  l.panicsRecovered.Load(),
 	}
-	unlock(l.writeLock)
-	unlock(l.mu)
-	return l
 }
 
-func (logger *Logger) SetErrorOutput(errOutput io.Writer) {
-	logger.errOutputMutex.Lock()
-	defer logger.errOutputMutex.Unlock()
-	logger.errOutput = errOutput
+func (l *Logger) SetErrorOutput(errOutput io.Writer) {
+	l.errOutputMutex.Lock()
+	defer l.errOutputMutex.Unlock()
+	l.errOutput = errOutput
 }
 
-// Close closes the TCP connection to logentries.com
-func (logger *Logger) Close() error {
-	if logger.conn != nil {
-		return logger.conn.Close()
-	}
+func (l *Logger) SetNumberOfRetries(retries int) {
+	l.cfgMu.Lock()
+	defer l.cfgMu.Unlock()
+	l.numRetries = retries
+}
 
+func (l *Logger) Flags() int {
+	l.cfgMu.Lock()
+	defer l.cfgMu.Unlock()
+	return l.flag
+}
+
+func (l *Logger) SetFlags(flag int) {
+	l.cfgMu.Lock()
+	defer l.cfgMu.Unlock()
+	l.flag = flag
+}
+
+func (l *Logger) Prefix() string {
+	l.cfgMu.Lock()
+	defer l.cfgMu.Unlock()
+	return l.prefix
+}
+
+func (l *Logger) SetPrefix(prefix string) {
+	l.cfgMu.Lock()
+	defer l.cfgMu.Unlock()
+	l.prefix = prefix
+}
+
+// Close signals the logger to shut down and blocks until the async queue
+// is drained and the connection is closed. Idempotent.
+func (l *Logger) Close() error {
+	l.signalShutdown()
+	<-l.exited
 	return nil
 }
 
-// Opens a TCP connection to logentries.com
-func (logger *Logger) openConnection() error {
-	conn, err := tls.Dial("tcp", logger.host, &tls.Config{})
-	if err != nil {
-		return err
+func (l *Logger) signalShutdown() {
+	if l.closed.CompareAndSwap(false, true) {
+		close(l.done)
 	}
-	logger.conn = conn
-	return nil
 }
 
-// It returns if the TCP connection to logentries.com is open
-func (logger *Logger) isOpenConnection() bool {
-	if logger.conn == nil {
-		return false
-	}
-
-	if time.Now().After(logger.lastRefreshAt.Add(15 * time.Minute)) {
-		logger.conn.Close()
-		return false
-	}
-
-	buf := make([]byte, 1)
-
-	logger.conn.SetReadDeadline(time.Now())
-
-	_, err := logger.conn.Read(buf)
-
-	switch err.(type) {
-	case net.Error:
-		if err.(net.Error).Timeout() == true {
-			logger.conn.SetReadDeadline(time.Time{})
-
-			return true
-		}
-	}
-
-	return false
-}
-
-// It ensures that the TCP connection to logentries.com is open.
-// If the connection is closed, a new one is opened.
-func (logger *Logger) ensureOpenConnection() error {
-	if !logger.isOpenConnection() {
-		if err := logger.openConnection(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Fatal is same as Print() but calls to os.Exit(1)
-func (logger *Logger) Fatal(v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprint(v...), handleFatalActions)
-}
-
-// Fatalf is same as Printf() but calls to os.Exit(1)
-func (logger *Logger) Fatalf(format string, v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprintf(format, v...), handleFatalActions)
-}
-
-// Fatalln is same as Println() but calls to os.Exit(1)
-func (logger *Logger) Fatalln(v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprintln(v...), handleFatalActions)
-}
-
-// Flags returns the logger flags
-func (logger *Logger) Flags() int {
-	<-logger.mu
-	defer unlock(logger.mu)
-	return logger.flag
-}
-
-// When we want to use errOutput, make sure it is not being modified in SetErrorOutput
-func (l *Logger) writeToErrOutput(s string) {
-	l.errOutputMutex.RLock()
-	defer l.errOutputMutex.RUnlock()
-	fmt.Fprintf(l.errOutput, s)
-}
-
-// Taken with slight modification from src/log/log.go
-// Output writes the output for a logging event. The string s contains
-// the text to print after the prefix specified by the flags of the
-// Logger. A newline is appended if the last character of s is not
-// already a newline. Calldepth is used to recover the PC and is
-// provided for generality, although at the moment on all pre-defined
-// paths it will be 3 plus a given offset.
-// Output does the actual writing to the TCP connection
-func (l *Logger) Output(calldepth int, s string, doAsync func()) {
-	defer func() {
-		if re := recover(); re != nil {
-			l.writeToErrOutput(fmt.Sprintf("Panicked in logger.output %v\n", re))
-			debug.PrintStack()
-			panic(re)
-		}
-	}()
-	if l.concurrentWrites != nil {
-		select {
-		case <-l.concurrentWrites:
-		default:
-			return
-		}
-	}
-	now := time.Now() // get this early.
-	var file string
-	var line int
-	select {
-	case <-l.mu:
-	case <-time.After(l.writeTimeout):
-		l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu, wanted to log: %s", s))
-		l._testTimedoutWrite()
+// Output dispatches a log message asynchronously through the channel.
+// Calldepth is provided for runtime.Caller file/line resolution.
+func (l *Logger) Output(calldepth int, s string) {
+	if l.closed.Load() {
+		l.droppedClosed.Add(1)
+		l._testDropped(DropClosed)
 		return
 	}
-	defer unlock(l.mu)
-	if l.flag&(log.Lshortfile|log.Llongfile) != 0 {
-		// Release lock while getting caller info - it's expensive.
-		unlock(l.mu)
+
+	l.cfgMu.Lock()
+	flag, prefix, numRetries := l.flag, l.prefix, l.numRetries
+	l.cfgMu.Unlock()
+
+	var file string
+	var line int
+	if flag&(log.Lshortfile|log.Llongfile) != 0 {
 		var ok bool
 		_, file, line, ok = runtime.Caller(calldepth)
 		if !ok {
 			file = "???"
 			line = 0
 		}
+	}
+
+	s = replaceEmbeddedNewlines(s)
+
+	e := entry{
+		s:          s,
+		file:       file,
+		line:       line,
+		flag:       flag,
+		prefix:     prefix,
+		numRetries: numRetries,
+		now:        time.Now(),
+	}
+
+	if l.closed.Load() {
+		l.droppedClosed.Add(1)
+		l._testDropped(DropClosed)
+		return
+	}
+
+	select {
+	case l.ch <- e:
+	case <-l.done:
+		l.droppedClosed.Add(1)
+		l._testDropped(DropClosed)
+	default:
 		select {
-		case <-l.mu:
-		case <-time.After(l.writeTimeout):
-			l.writeToErrOutput(fmt.Sprintf("Timedout waiting for logger.mu after getting caller info, wanted to log: %s", s))
-			l._testTimedoutWrite()
+		case <-l.done:
+			l.droppedClosed.Add(1)
+			l._testDropped(DropClosed)
+		default:
+			l.droppedQueueFull.Add(1)
+			l._testDropped(DropQueueFull)
+		}
+	}
+}
+
+func (l *Logger) Print(v ...interface{}) {
+	l.Output(3+l.calldepthOffset, fmt.Sprint(v...))
+}
+
+func (l *Logger) Printf(format string, v ...interface{}) {
+	l.Output(3+l.calldepthOffset, fmt.Sprintf(format, v...))
+}
+
+func (l *Logger) Println(v ...interface{}) {
+	l.Output(3+l.calldepthOffset, fmt.Sprintln(v...))
+}
+
+// Write implements io.Writer. It prepends the access token and appends a
+// trailing newline. Write is synchronous and decoupled from the async Print
+// queue — it acquires connMu directly.
+func (l *Logger) Write(p []byte) (int, error) {
+	if l.closed.Load() {
+		return 0, ErrLoggerClosed
+	}
+
+	l.cfgMu.Lock()
+	numRetries := l.numRetries
+	l.cfgMu.Unlock()
+
+	raw := make([]byte, 0, len(l.token)+1+len(p)+1)
+	raw = append(raw, (l.token + " ")...)
+	raw = append(raw, p...)
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		raw = append(raw, '\n')
+	}
+
+	l.connMu.Lock()
+	defer l.connMu.Unlock()
+
+	if l.closed.Load() {
+		return 0, ErrLoggerClosed
+	}
+	if err := l.ensureOpenConnectionLocked(); err != nil {
+		return 0, err
+	}
+	if err := l.writeRawBytesLocked(raw, numRetries); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Flush waits for all queued async Print entries to be processed.
+// Returns ErrLoggerClosed if the logger is closed during the wait.
+func (l *Logger) Flush() error {
+	if l.closed.Load() {
+		return ErrLoggerClosed
+	}
+	ack := make(chan error, 1)
+	select {
+	case l.ch <- entry{flush: true, ack: ack}:
+	case <-l.done:
+		return ErrLoggerClosed
+	}
+	select {
+	case err := <-ack:
+		return err
+	case <-l.done:
+		return ErrLoggerClosed
+	}
+}
+
+func (l *Logger) Fatal(v ...interface{}) {
+	s := fmt.Sprint(v...)
+	l.fatalCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) Fatalf(format string, v ...interface{}) {
+	s := fmt.Sprintf(format, v...)
+	l.fatalCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) Fatalln(v ...interface{}) {
+	s := fmt.Sprintln(v...)
+	l.fatalCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) fatalCommon(s string, calldepth int) {
+	formatted, file, line, flag, prefix := l.formatMessage(s, calldepth+1)
+
+	l.cfgMu.Lock()
+	numRetries := l.numRetries
+	l.cfgMu.Unlock()
+
+	acquired := l.tryAcquireConnMu(fatalLockWait)
+	if !acquired {
+		l.droppedSyncLock.Add(1)
+		l._testDropped(DropSyncLock)
+		l.writeToErrOutput("Fatal could not acquire conn lock; exiting without flush\n")
+		os.Exit(1)
+	}
+	defer l.connMu.Unlock()
+
+	if !l.closed.Load() {
+		_ = l.writeFormattedMessageLocked(formatted, file, time.Now(), line, flag, prefix, numRetries)
+	}
+	os.Exit(1)
+}
+
+func (l *Logger) Panic(v ...interface{}) {
+	s := fmt.Sprint(v...)
+	l.panicCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) Panicf(format string, v ...interface{}) {
+	s := fmt.Sprintf(format, v...)
+	l.panicCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) Panicln(v ...interface{}) {
+	s := fmt.Sprintln(v...)
+	l.panicCommon(s, 3+l.calldepthOffset)
+}
+
+func (l *Logger) panicCommon(s string, calldepth int) {
+	formatted, file, line, flag, prefix := l.formatMessage(s, calldepth+1)
+
+	l.cfgMu.Lock()
+	numRetries := l.numRetries
+	l.cfgMu.Unlock()
+
+	acquired := l.tryAcquireConnMu(fatalLockWait)
+	if !acquired {
+		l.droppedSyncLock.Add(1)
+		l._testDropped(DropSyncLock)
+		panic(s)
+	}
+
+	if !l.closed.Load() {
+		_ = l.writeFormattedMessageLocked(formatted, file, time.Now(), line, flag, prefix, numRetries)
+	}
+	l.connMu.Unlock()
+	panic(s)
+}
+
+// --- Consumer goroutine ---
+
+func (l *Logger) run() {
+	defer close(l.exited)
+	panicsSinceLastSuccess := 0
+
+	for {
+		exited := func() bool {
+			defer func() {
+				if r := recover(); r != nil {
+					l.panicsRecovered.Add(1)
+					panicsSinceLastSuccess++
+					l.writeToErrOutput(fmt.Sprintf(
+						"consumer panic recovered (%d/%d): %v\n",
+						panicsSinceLastSuccess, maxConsecutivePanics, r))
+				}
+			}()
+			for {
+				select {
+				case e := <-l.ch:
+					l.processAsync(e, &panicsSinceLastSuccess)
+				case <-l.done:
+					l.drain()
+					l.closeConnLocked()
+					return true
+				}
+			}
+		}()
+
+		if exited {
+			return
+		}
+
+		if panicsSinceLastSuccess >= maxConsecutivePanics {
+			l.writeToErrOutput("consumer hit panic limit; shutting down logger\n")
+			l.signalShutdown()
+			l.drain()
+			l.closeConnLocked()
 			return
 		}
 	}
-
-	// Replace all but the trailing newline with `\u2028`
-	count := strings.Count(s, lineSep)
-	s = strings.Replace(s, lineSep, "\u2028", count-1)
-
-	l.wg.Add(1)
-	go func() {
-		defer l.wg.Done()
-		l.writeToLogEntries(s, file, now, line)
-		doAsync()
-		if l.concurrentWrites != nil {
-			l.concurrentWrites <- struct{}{}
-		}
-	}()
 }
 
-func (l *Logger) Flush() {
-	defer func() {
-		if re := recover(); re != nil {
-			//Protect against misused waitgroups
-			//Usually won't be an issue if the Flush is not waiting a long time
-			log.Println("Recovered while flushing logs")
-		}
-	}()
-	l.wg.Wait()
-}
-
-// Panic is same as Print() but calls to panic
-func (logger *Logger) Panic(v ...interface{}) {
-	s := fmt.Sprint(v...)
-	logger.Output(3+logger.calldepthOffset, s, handlePanicActions(s))
-}
-
-// Panicf is same as Printf() but calls to panic
-func (logger *Logger) Panicf(format string, v ...interface{}) {
-	s := fmt.Sprintf(format, v...)
-	logger.Output(3+logger.calldepthOffset, s, handlePanicActions(s))
-}
-
-// Panicln is same as Println() but calls to panic
-func (logger *Logger) Panicln(v ...interface{}) {
-	s := fmt.Sprintln(v...)
-	logger.Output(3+logger.calldepthOffset, s, handlePanicActions(s))
-}
-
-// Prefix returns the logger prefix
-func (logger *Logger) Prefix() string {
-	<-logger.mu
-	defer unlock(logger.mu)
-	return logger.prefix
-}
-
-// Print logs a message
-func (logger *Logger) Print(v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprint(v...), handlePrintActions)
-}
-
-// Printf logs a formatted message
-func (logger *Logger) Printf(format string, v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprintf(format, v...), handlePrintActions)
-}
-
-// Println logs a message with a linebreak
-func (logger *Logger) Println(v ...interface{}) {
-	logger.Output(3+logger.calldepthOffset, fmt.Sprintln(v...), handlePrintActions)
-}
-
-// SetFlags sets the logger flags
-func (logger *Logger) SetFlags(flag int) {
-	<-logger.mu
-	defer unlock(logger.mu)
-	logger.flag = flag
-}
-
-func (logger *Logger) SetNumberOfRetries(retries int) {
-	logger.numRetries = retries
-}
-
-// SetPrefix sets the logger prefix
-func (logger *Logger) SetPrefix(prefix string) {
-	<-logger.mu
-	defer unlock(logger.mu)
-	logger.prefix = prefix
-}
-
-// Write writes a bytes array to the Logentries TCP connection,
-// it adds the access token and prefix and also replaces
-// line breaks with the unicode \u2028 character
-func (logger *Logger) Write(p []byte) (n int, err error) {
-	if err := logger.ensureOpenConnection(); err != nil {
-		return 0, err
+func (l *Logger) processAsync(e entry, panicsSinceLastSuccess *int) {
+	if e.flush {
+		e.ack <- nil
+		return
 	}
 
-	return logger.conn.Write(p)
+	l.connMu.Lock()
+	defer l.connMu.Unlock()
+
+	if err := l.writeFormattedMessageLocked(e.s, e.file, e.now, e.line, e.flag, e.prefix, e.numRetries); err != nil {
+		l.writeToErrOutput(fmt.Sprintf("le_go: write error: %s; payload len: %d\n", err, len(e.s)))
+		return
+	}
+
+	*panicsSinceLastSuccess = 0
 }
 
-// Taken wholesale from src/log/log.go
-// formatHeader writes log header to buf in following order:
-//   - l.prefix (if it's not blank),
-//   - date and/or time (if corresponding flags are provided),
-//   - file and line number (if corresponding flags are provided).
-func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
-	*buf = append(*buf, l.prefix...)
-	if l.flag&(log.Ldate|log.Ltime|log.Lmicroseconds) != 0 {
-		if l.flag&log.LUTC != 0 {
+func (l *Logger) drain() {
+	for {
+		select {
+		case e := <-l.ch:
+			if e.flush {
+				e.ack <- nil
+				continue
+			}
+			l.connMu.Lock()
+			if l.conn != nil {
+				_ = l.writeFormattedMessageLocked(e.s, e.file, e.now, e.line, e.flag, e.prefix, e.numRetries)
+			}
+			l.connMu.Unlock()
+		default:
+			return
+		}
+	}
+}
+
+func (l *Logger) closeConnLocked() {
+	l.connMu.Lock()
+	defer l.connMu.Unlock()
+	if l.conn != nil {
+		_ = l.conn.Close()
+		l.conn = nil
+	}
+}
+
+func replaceEmbeddedNewlines(s string) string {
+	s = strings.TrimRight(s, lineSep)
+	return strings.ReplaceAll(s, lineSep, "\u2028")
+}
+
+// --- Formatting & writing ---
+
+// formatMessage builds a fully-formatted log message (token + header + s + \n)
+// for the Fatal/Panic direct path. Called BEFORE acquiring connMu.
+// For messages longer than maxLogLength, this returns the full payload and
+// writeFormattedBytesLocked handles chunking.
+func (l *Logger) formatMessage(s string, calldepth int) (formatted string, file string, line int, flag int, prefix string) {
+	l.cfgMu.Lock()
+	flag, prefix = l.flag, l.prefix
+	l.cfgMu.Unlock()
+
+	if flag&(log.Lshortfile|log.Llongfile) != 0 {
+		var ok bool
+		_, file, line, ok = runtime.Caller(calldepth)
+		if !ok {
+			file = "???"
+			line = 0
+		}
+	}
+
+	formatted = replaceEmbeddedNewlines(s)
+	return
+}
+
+// writeFormattedMessageLocked writes a log message, chunking at maxLogLength.
+// Each chunk is individually prefixed with token + header and newline-terminated.
+// Caller must hold connMu.
+func (l *Logger) writeFormattedMessageLocked(s, file string, now time.Time, line, flag int, prefix string, numRetries int) error {
+	if err := l.ensureOpenConnectionLocked(); err != nil {
+		return err
+	}
+
+	i := 0
+	for {
+		end := i + maxLogLength - 2
+		if end > len(s) {
+			end = len(s)
+		}
+
+		var buf []byte
+		buf = append(buf, (l.token + " ")...)
+		formatHeader(&buf, now, file, line, flag, prefix)
+		buf = append(buf, s[i:end]...)
+		buf = append(buf, '\n')
+
+		if err := l.writeRawBytesLocked(buf, numRetries); err != nil {
+			return err
+		}
+
+		i = end
+		if i >= len(s) {
+			break
+		}
+	}
+	return nil
+}
+
+func formatHeader(buf *[]byte, t time.Time, file string, line int, flag int, prefix string) {
+	*buf = append(*buf, prefix...)
+	if flag&(log.Ldate|log.Ltime|log.Lmicroseconds) != 0 {
+		if flag&log.LUTC != 0 {
 			t = t.UTC()
 		}
-		if l.flag&log.Ldate != 0 {
+		if flag&log.Ldate != 0 {
 			year, month, day := t.Date()
 			itoa(buf, year, 4)
 			*buf = append(*buf, '/')
@@ -354,22 +614,22 @@ func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
 			itoa(buf, day, 2)
 			*buf = append(*buf, ' ')
 		}
-		if l.flag&(log.Ltime|log.Lmicroseconds) != 0 {
+		if flag&(log.Ltime|log.Lmicroseconds) != 0 {
 			hour, min, sec := t.Clock()
 			itoa(buf, hour, 2)
 			*buf = append(*buf, ':')
 			itoa(buf, min, 2)
 			*buf = append(*buf, ':')
 			itoa(buf, sec, 2)
-			if l.flag&log.Lmicroseconds != 0 {
+			if flag&log.Lmicroseconds != 0 {
 				*buf = append(*buf, '.')
 				itoa(buf, t.Nanosecond()/1e3, 6)
 			}
 			*buf = append(*buf, ' ')
 		}
 	}
-	if l.flag&(log.Lshortfile|log.Llongfile) != 0 {
-		if l.flag&log.Lshortfile != 0 {
+	if flag&(log.Lshortfile|log.Llongfile) != 0 {
+		if flag&log.Lshortfile != 0 {
 			short := file
 			for i := len(file) - 1; i > 0; i-- {
 				if file[i] == '/' {
@@ -386,10 +646,7 @@ func (l *Logger) formatHeader(buf *[]byte, t time.Time, file string, line int) {
 	}
 }
 
-// Taken wholesale from src/log/log.go
-// Cheap integer to fixed-width decimal ASCII. Give a negative width to avoid zero-padding.
 func itoa(buf *[]byte, i int, wid int) {
-	// Assemble decimal in reverse order.
 	var b [20]byte
 	bp := len(b) - 1
 	for i >= 10 || wid > 1 {
@@ -399,81 +656,126 @@ func itoa(buf *[]byte, i int, wid int) {
 		bp--
 		i = q
 	}
-	// i < 10
 	b[bp] = byte('0' + i)
 	*buf = append(*buf, b[bp:]...)
 }
 
-func (l *Logger) writeToLogEntries(s, file string, now time.Time, line int) {
-	select {
-	case <-l.writeLock:
-	case <-time.After(l.writeTimeout):
-		//Bail out here
-		l.writeToErrOutput(fmt.Sprintf("%s: Timedout waiting for logging writelock: wanted to log: %s", time.Now().UTC(), s))
-		l._testTimedoutWrite()
-		return
+// --- Connection management (caller must hold connMu) ---
+
+func (l *Logger) openConnectionLocked() error {
+	if l.conn != nil {
+		_ = l.conn.Close()
 	}
 
-	defer unlock(l.writeLock)
+	dialer := &net.Dialer{Timeout: l.dialTimeout}
+	tlsCfg := &tls.Config{}
+	if l.tlsConfig != nil {
+		tlsCfg = l.tlsConfig
+	}
 
-	var i, n int
-	var err error
+	conn, err := tls.DialWithDialer(dialer, "tcp", l.host, tlsCfg)
+	if err != nil {
+		l.conn = nil
+		return err
+	}
 
-	for i = 0; i < len(s); i = i + n {
-		end := i + maxLogLength - 2
-		if end > len(s) {
-			end = len(s)
-		}
-		l.buf = l.buf[:0]
-		l.buf = append(l.buf, (l.token + " ")...)
-		l.formatHeader(&l.buf, now, file, line)
-		l.buf = append(l.buf, s[i:end]...)
-		if len(s) == 0 || s[len(s)-1] != '\n' {
-			l.buf = append(l.buf, '\n')
-		}
-		err = l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout))
-		if err != nil {
-			log.Printf("le_go: Error setting write deadline: %s", err.Error())
-			log.Printf("Wanted to log: %s", s)
-			return
+	if tc, ok := conn.NetConn().(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	l.conn = conn
+	l.lastRefreshAt = time.Now()
+	return nil
+}
+
+func (l *Logger) ensureOpenConnectionLocked() error {
+	if l.conn == nil || time.Since(l.lastRefreshAt) > 15*time.Minute {
+		return l.openConnectionLocked()
+	}
+	return nil
+}
+
+// writeRawBytesLocked writes data to the TCP connection with retries.
+// Caller must hold connMu. May temporarily release connMu during retry backoff
+// when no bytes have been sent yet (to allow Fatal/Panic TryLock to succeed
+// during the sleep window).
+func (l *Logger) writeRawBytesLocked(data []byte, numRetries int) error {
+	var bytesSent int
+	var lastErr error
+
+	for attempt := 0; attempt <= numRetries; attempt++ {
+		if attempt > 0 {
+			if bytesSent == 0 {
+				l.connMu.Unlock()
+				time.Sleep(retryBackoff)
+				l.connMu.Lock()
+				if l.closed.Load() {
+					return ErrLoggerClosed
+				}
+				if err := l.ensureOpenConnectionLocked(); err != nil {
+					lastErr = err
+					continue
+				}
+			} else {
+				time.Sleep(retryBackoff)
+			}
 		}
 
-		numAttempts := 1 + l.numRetries
-		for i := 0; i < numAttempts; i++ {
-			n, err = l.Write(l.buf)
-			if err != nil {
-				log.Printf("Error in write call: %s", err.Error())
-				log.Printf("Wanted to log: %s", s)
-				<-time.After(100 * time.Millisecond)
+		if l.conn == nil {
+			if err := l.ensureOpenConnectionLocked(); err != nil {
+				lastErr = err
 				continue
 			}
-
-			if l._testWaitForWrite != nil {
-				l._testWaitForWrite.Done()
-			}
-			break
 		}
 
+		if err := l.conn.SetWriteDeadline(time.Now().Add(l.writeTimeout)); err != nil {
+			lastErr = err
+			l.writeToErrOutput(fmt.Sprintf("le_go: SetWriteDeadline error: %s\n", err))
+			continue
+		}
+
+		n, err := l.conn.Write(data)
 		if err != nil {
-			return
+			lastErr = err
+			l.writeToErrOutput(fmt.Sprintf("le_go: write error: %s\n", err))
+			l.conn.Close()
+			l.conn = nil
+			continue
 		}
+
+		bytesSent += n
+		if l._testWaitForWrite != nil {
+			l._testWaitForWrite.Done()
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func (l *Logger) tryAcquireConnMu(budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for {
+		if l.connMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-func handleFatalActions() {
-	os.Exit(1)
+func (l *Logger) writeToErrOutput(s string) {
+	l.errOutputMutex.Lock()
+	defer l.errOutputMutex.Unlock()
+	fmt.Fprint(l.errOutput, s)
 }
 
-func handlePanicActions(s string) func() {
-	return func() {
-		panic(s)
-	}
-}
-
-func handlePrintActions() {
-	return
-}
-
-func unlock(c chan struct{}) {
-	c <- struct{}{}
+// withConnLocked calls fn with the current connection while holding connMu.
+// Intended for test use only.
+func (l *Logger) withConnLocked(fn func(net.Conn)) {
+	l.connMu.Lock()
+	defer l.connMu.Unlock()
+	fn(l.conn)
 }

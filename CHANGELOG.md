@@ -14,3 +14,4 @@
  - Allow error output to be set
  - Ensure that when we are using errorOutput, it is threadsafe
  - Add retries 
+ - Rewrote le_go: async channel for Print, direct connMu for Write, TryLock-bounded for Fatal/Panic. Fixes goroutine fan-out, chunk truncation, connection storm, async Fatal/Panic. See package godoc for behavior changes.
